@@ -1,0 +1,8 @@
+{
+  "additional_args": [],
+  "timeout_secs": 600,
+  "max_timeout_secs": 3600,
+  "default_auto": "high",
+  "default_model": "claude-opus-4-5-20251101",
+  "allow_high_autonomy": true
+}
