@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (without the v prefix, e.g. 0.1.1)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark release as prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate Release Version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Check for valid semver format
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+            echo "❌ Error: Invalid version format: $VERSION"
+            echo "Expected semver format: X.Y.Z or X.Y.Z-prerelease"
+            exit 1
+          fi
+
+          # Check that version doesn't start with 'v'
+          if echo "$VERSION" | grep -qE '^v'; then
+            echo "❌ Error: Version should not include 'v' prefix"
+            echo "Got: $VERSION, Expected: ${VERSION#v}"
+            exit 1
+          fi
+
+          echo "✓ Version format is valid: $VERSION"
+
+      - name: Verify Cargo.toml version matches
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION=$(grep -E '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+
+          if [ "$CARGO_VERSION" != "$VERSION" ]; then
+            echo "⚠️  Warning: Cargo.toml version ($CARGO_VERSION) doesn't match release version ($VERSION)"
+            echo "Consider updating Cargo.toml before releasing"
+          else
+            echo "✓ Cargo.toml version matches: $VERSION"
+          fi
+
+  create_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: validate
+    steps:
+      - name: Create or verify release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ inputs.version }}
+          IS_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          # Check if release exists
+          if gh release view "$TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "✓ Release $TAG already exists"
+
+            # Check if it's a draft or published
+            RELEASE_JSON=$(gh release view "$TAG" --repo ${{ github.repository }} --json isDraft)
+            IS_DRAFT=$(echo "$RELEASE_JSON" | grep -oP '"isDraft":\s*\K(true|false)')
+
+            if [ "$IS_DRAFT" = "false" ]; then
+              echo "⚠️  Warning: Release $TAG is already published (not a draft)"
+              echo "Uploading will overwrite existing assets"
+            else
+              echo "✓ Release is in draft state"
+            fi
+          else
+            echo "Creating new release $TAG..."
+            flags="--draft --generate-notes --repo ${{ github.repository }}"
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              flags="$flags --prerelease"
+            fi
+            gh release create "$TAG" $flags --title "droid-mcp-rs $TAG"
+          fi
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: create_release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64 (GNU)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin_ext: ""
+            install_musl: false
+
+          - name: Linux x86_64 (musl)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            bin_ext: ""
+            install_musl: true
+
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin_ext: ".exe"
+            install_musl: false
+
+          - name: macOS x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin_ext: ""
+            install_musl: false
+
+          - name: macOS ARM64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin_ext: ""
+            install_musl: false
+
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: v${{ inputs.version }}
+      BIN_NAME: droid-mcp-rs${{ matrix.bin_ext }}
+      ASSET_NAME: droid-mcp-rs-${{ inputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.install_musl
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          prefix-key: v1-release
+          shared-key: ${{ runner.os }}-${{ matrix.target }}-${{ inputs.version }}
+
+      - name: Build release binary with retry
+        run: |
+          set -euo pipefail
+
+          # Retry logic for network issues with git dependencies
+          for attempt in 1 2 3; do
+            echo "Build attempt $attempt/3..."
+            if cargo build --release --locked --target ${{ matrix.target }}; then
+              echo "✓ Build succeeded"
+              break
+            else
+              if [ $attempt -lt 3 ]; then
+                echo "Build failed, retrying in 5 seconds..."
+                sleep 5
+              else
+                echo "❌ Build failed after 3 attempts"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Verify binary exists
+        run: |
+          set -euo pipefail
+          BINARY_PATH="target/${{ matrix.target }}/release/${BIN_NAME}"
+
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "❌ Error: Binary not found at $BINARY_PATH"
+            exit 1
+          fi
+
+          # Show binary size
+          if command -v stat >/dev/null; then
+            SIZE=$(stat -c%s "$BINARY_PATH" 2>/dev/null || stat -f%z "$BINARY_PATH")
+            echo "✓ Binary size: $(( SIZE / 1024 / 1024 )) MB"
+          fi
+
+      - name: Prepare distribution (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp LICENSE dist/
+          cp README.md dist/
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" dist/
+          tar -C dist -czf "${ASSET_NAME}" .
+
+      - name: Prepare distribution (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          New-Item -ItemType Directory -Path dist
+          Copy-Item LICENSE dist/
+          Copy-Item README.md dist/
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}" dist/
+
+          # Verify binary was copied
+          if (-not (Test-Path "dist/${env:BIN_NAME}")) {
+            Write-Error "Binary not found in dist directory"
+            exit 1
+          }
+
+          # Show binary size
+          $size = (Get-Item "dist/${env:BIN_NAME}").Length
+          Write-Host "✓ Binary size: $([math]::Round($size / 1MB, 2)) MB"
+
+          Compress-Archive -Path dist\* -DestinationPath "${env:ASSET_NAME}"
+
+      - name: Generate SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ASSET_NAME}" > "${ASSET_NAME}.sha256"
+          else
+            # macOS uses shasum instead of sha256sum
+            shasum -a 256 "${ASSET_NAME}" | awk '{print $1 "  " $2}' > "${ASSET_NAME}.sha256"
+          fi
+          cat "${ASSET_NAME}.sha256"
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $hash = Get-FileHash "${env:ASSET_NAME}" -Algorithm SHA256
+          $output = "$($hash.Hash.ToLower())  ${env:ASSET_NAME}"
+          $output | Out-File -Encoding ascii "${env:ASSET_NAME}.sha256"
+          Get-Content "${env:ASSET_NAME}.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Uploading ${ASSET_NAME} and checksum to ${TAG}..."
+          gh release upload "${TAG}" "${ASSET_NAME}" "${ASSET_NAME}.sha256" --repo ${{ github.repository }} --clobber
